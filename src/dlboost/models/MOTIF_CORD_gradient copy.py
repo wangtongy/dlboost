@@ -7,7 +7,6 @@ from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
 from mrboost.computation import generate_nufft_op, nufft_2d, nufft_adj_2d
 from pytorch_lightning import LightningModule
-from torch.utils.tensorboard import SummaryWriter
 
 
 class CSM_FixPh(nn.Module):
@@ -18,8 +17,9 @@ class CSM_FixPh(nn.Module):
         self._csm = csm_kernels
 
     def forward(self, image):
+        # breakpoint()
         return image * self._csm
-
+# (1,1,8,320,320)*(1,20,8,320,320) = (1,20,8,320,320)
 
 class NUFFT(nn.Module):
     def __init__(self, nufft_im_size):
@@ -61,9 +61,9 @@ class MR_Forward_Model_Static(nn.Module):
         self.N.generate_forward_operator(kspace_traj)
 
     def forward(self, image):
-        _image = image.clone()
-        image_multi_ch = self.S(_image) #Coil sensitivity * image
-        kspace_data_estimated = self.N(image_multi_ch.clone()) # S* F * C * Image
+        #_image = image.clone()
+        image_multi_ch = self.S(image) #Coil sensitivity * image
+        kspace_data_estimated = self.N(image_multi_ch) # S* F * C * Image
         return kspace_data_estimated
 
 
@@ -150,15 +150,15 @@ class MOTIF_CORD(nn.Module):
         self.regularization = Regularization()
         self.epsilon = epsilon
         self.iterations = iterations
+        #self.gamma = nn.Parameter(gamma_init*torch.ones(iterations))
         self.gamma = gamma_init
-        #self.tau = tau_init
         self.tau = nn.Parameter(tau_init * torch.ones(iterations))
         self.downsample = lambda x: interpolate(
             x, scale_factor=(1, 0.5, 0.5), mode="trilinear"
         )
         self.loss_fn = nn.MSELoss(reduction="mean") ## L2 loss
         # self.nufft_adj = tkbn.KbNufftAdjoint(im_size=nufft_im_size)
-        self.writer = SummaryWriter(log_dir="/bmrc-an-data/TongyaoW/Reconstruction/AcceleratedMR/Undersample/MOTIF_CORD_ty/logs")
+
     def forward(
         self,
         kspace_data,
@@ -166,7 +166,7 @@ class MOTIF_CORD(nn.Module):
         image_init,
         csm,
         std,
-        weights_flag=True,
+        weights_flag=False,
     ):
         image_init = torch.nan_to_num_(image_init) 
         image_list = [] 
@@ -181,16 +181,18 @@ class MOTIF_CORD(nn.Module):
             dc_loss = self.inner_loss(
                 x.clone(), kspace_data, weights_flag
             )  ## data consistency loss
-            # self.writer.add_scalar("InnerLoss",dc_loss.item(),t)
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
             grad_reg = x - self.regularization(x, std=std)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
-            #updates = -self.gamma*grad_dc
-            # ic(self.gamma)
-            # ic(self.tau[t]) 
+            #updates = -(self.gamma * grad_dc)
+            mean_grad_dc = torch.mean(grad_dc)
+            mean_grad_reg = torch.mean(grad_reg)
+            ic(self.gamma)
+            ic(self.tau[t]) 
             x = x.add(updates) #batch, channel, z, h,w
             image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
             print(f"t: {t}, innerloss: {dc_loss}")
+            print(f"t:{t}, gdc = {mean_grad_dc}, greg = {mean_grad_reg}")
         return x, image_list
  
     def inner_loss(self, x, kspace_data, weights_flag): 
@@ -208,5 +210,6 @@ class MOTIF_CORD(nn.Module):
             torch.view_as_real(weights * kspace_data_estimated),
             torch.view_as_real(weights * kspace_data),
         )
+      
         #self.log("DC_loss", loss_dc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss_dc

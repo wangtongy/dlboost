@@ -7,7 +7,10 @@ from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
 from mrboost.computation import generate_nufft_op, nufft_2d, nufft_adj_2d
 from pytorch_lightning import LightningModule
-from torch.utils.tensorboard import SummaryWriter
+from mrboost.computation import (
+    kspace_point_to_radial_spokes,
+    radial_spokes_to_kspace_point,
+)
 
 
 class CSM_FixPh(nn.Module):
@@ -18,8 +21,9 @@ class CSM_FixPh(nn.Module):
         self._csm = csm_kernels
 
     def forward(self, image):
+        # breakpoint()
         return image * self._csm
-
+# (1,1,8,320,320)*(1,20,8,320,320) = (1,20,8,320,320)
 
 class NUFFT(nn.Module):
     def __init__(self, nufft_im_size):
@@ -61,9 +65,9 @@ class MR_Forward_Model_Static(nn.Module):
         self.N.generate_forward_operator(kspace_traj)
 
     def forward(self, image):
-        _image = image.clone()
-        image_multi_ch = self.S(_image) #Coil sensitivity * image
-        kspace_data_estimated = self.N(image_multi_ch.clone()) # S* F * C * Image
+        #_image = image.clone()
+        image_multi_ch = self.S(image) #Coil sensitivity * image
+        kspace_data_estimated = self.N(image_multi_ch) # S* F * C * Image
         return kspace_data_estimated
 
 
@@ -150,15 +154,16 @@ class MOTIF_CORD(nn.Module):
         self.regularization = Regularization()
         self.epsilon = epsilon
         self.iterations = iterations
+        #self.gamma = nn.Parameter(gamma_init*torch.ones(iterations))
         self.gamma = gamma_init
-        #self.tau = tau_init
         self.tau = nn.Parameter(tau_init * torch.ones(iterations))
         self.downsample = lambda x: interpolate(
             x, scale_factor=(1, 0.5, 0.5), mode="trilinear"
         )
-        self.loss_fn = nn.MSELoss(reduction="mean") ## L2 loss
+        # self.loss_fn = nn.MSELoss(reduction="mean") ## L2 loss
+        self.loss_fn = torch.nn.L1Loss(reduction="mean")
         # self.nufft_adj = tkbn.KbNufftAdjoint(im_size=nufft_im_size)
-        self.writer = SummaryWriter(log_dir="/bmrc-an-data/TongyaoW/Reconstruction/AcceleratedMR/Undersample/MOTIF_CORD_ty/logs")
+
     def forward(
         self,
         kspace_data,
@@ -179,28 +184,39 @@ class MOTIF_CORD(nn.Module):
         for t in range(self.iterations):
             print("iteration", t, "start")
             dc_loss = self.inner_loss(
-                x.clone(), kspace_data, weights_flag
+                x.clone(), kspace_data, kspace_traj,weights_flag
             )  ## data consistency loss
-            # self.writer.add_scalar("InnerLoss",dc_loss.item(),t)
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
             grad_reg = x - self.regularization(x, std=std)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
-            #updates = -self.gamma*grad_dc
+            #updates = -(self.gamma * grad_dc)
+            mean_grad_dc_real = torch.mean(grad_dc.real)
+            mean_grad_reg = torch.mean(grad_reg.real)
+            mean_grad_dc_imag = torch.mean(grad_dc.imag)
+            mean_grad_reg_imag = torch.mean(grad_reg.imag)
             # ic(self.gamma)
-            # ic(self.tau[t]) 
+            ic(self.tau[t]) 
             x = x.add(updates) #batch, channel, z, h,w
             image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
             print(f"t: {t}, innerloss: {dc_loss}")
+            print(f"t:{t}, gdc_real = {mean_grad_dc_real}, gdc_imag = {mean_grad_dc_imag},greg_real = {mean_grad_reg},greg_imag = {mean_grad_reg_imag}")
         return x, image_list
  
-    def inner_loss(self, x, kspace_data, weights_flag): 
+    def inner_loss(self, x, kspace_data,kspace_traj,weights_flag): 
         kspace_data_estimated = self.forward_model(x) #x^
         if weights_flag:
-            kspace_data_estimated_detatched = (
-                kspace_data_estimated.detach().abs()
-            )
-            norm_factor = kspace_data_estimated_detatched.max()
-            weights = 1 / (kspace_data_estimated_detatched / norm_factor + self.epsilon)
+            # kspace_data_estimated_detatched = (
+            #     kspace_data_estimated.detach().abs()
+            # )
+            # norm_factor = kspace_data_estimated_detatched.max()
+            # weights = 1 / (kspace_data_estimated_detatched / norm_factor + self.epsilon)
+            kspace_traj = kspace_point_to_radial_spokes(kspace_traj,640)
+            kspace_traj_norm = kspace_traj/kspace_traj.abs().max()/2
+            kx,ky = kspace_traj_norm[0]
+            kx_center,ky_center = kx.mean(),ky.mean()
+            distances = torch.sqrt((kx - kx_center) ** 2 + (ky - ky_center) ** 2) 
+            weights = distances/distances.max()+1 ## 1 is the epison to avoid zero division
+            weights = radial_spokes_to_kspace_point(weights)
         else:
             weights = 1
  
@@ -208,5 +224,6 @@ class MOTIF_CORD(nn.Module):
             torch.view_as_real(weights * kspace_data_estimated),
             torch.view_as_real(weights * kspace_data),
         )
+      
         #self.log("DC_loss", loss_dc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
         return loss_dc

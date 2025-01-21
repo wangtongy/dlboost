@@ -21,7 +21,7 @@ from torch import Tensor, vmap
 from dlboost.utils.tensor_utils import complex_normalize_abs_95
 
 complex_normalize_abs_95_v = vmap(
-    complex_normalize_abs_95, in_dims=0, out_dims=(0, 0, 0)
+    complex_normalize_abs_95, in_dims=0, out_dims=(0, 0)
 )
 
 
@@ -86,16 +86,22 @@ class ComplexUnet(nn.Module):
         """
         # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
         # print(x.shape)
+        
         if self.norm_with_given_std:
-            x = x / std
+            if std is None:
+                print("img has been normalized beforehand")
+                x = x
+            else:
+                x = x / std
+            
         else:
             mean, std = complex_normalize_abs_95_v(
                 x
             )  # x will be of shape (B,C*2,H,W)
             x = x / std
-
+        # breakpoint()
         x = torch.view_as_real(x)
-
+        # breakpoint()
         x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
         if input_append_channel is not None:
             x = einx.rearrange(
