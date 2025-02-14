@@ -1,8 +1,8 @@
 from jaxtyping import Complex, Float, Shaped
 from torch import Tensor
 
-KspaceData = Complex[Tensor, "length"]
-KspaceSpokesData = Float[Tensor, "spokes_num spoke_length"]
+KspaceData = Complex[Tensor, "length"] # 
+KspaceSpokesData = Complex[Tensor, "spokes_num spoke_length"]
 KspaceTraj = Float[Tensor, "2 length"]
 KspaceSpokesTraj = Float[Tensor, "2 spokes_num spoke_length"]
 Image2D = Float[Tensor, "h w"]

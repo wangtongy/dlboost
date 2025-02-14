@@ -7,11 +7,7 @@ from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
 from mrboost.computation import generate_nufft_op, nufft_2d, nufft_adj_2d
 from pytorch_lightning import LightningModule
-from mrboost.computation import (
-    kspace_point_to_radial_spokes,
-    radial_spokes_to_kspace_point,
-)
-import tracemalloc
+
 
 class CSM_FixPh(nn.Module):
     def __init__(self):
@@ -21,9 +17,8 @@ class CSM_FixPh(nn.Module):
         self._csm = csm_kernels
 
     def forward(self, image):
-        # breakpoint()
-        return image * self._csm
-# (1,1,8,320,320)*(1,20,8,320,320) = (1,20,8,320,320)
+        return image * self._csm 
+# csm: (1,ch,z,h,w)
 
 class NUFFT(nn.Module):
     def __init__(self, nufft_im_size):
@@ -72,7 +67,7 @@ class MR_Forward_Model_Static(nn.Module):
 
 
 class Regularization(nn.Module):
-    def __init__(self, pretrained_path="/bmrc-an-data/TongyaoW/Reconstruction/AcceleratedMR/Undersample/blackbone/experiments/BB_N2N_pretrain/N2N_Stationary_epoch=02.ckpt"):
+    def __init__(self, pretrained_path=None):
         super().__init__()
         self.image_denoiser = ComplexUnet(
             1,
@@ -160,54 +155,58 @@ class MOTIF_CORD(nn.Module):
         self.downsample = lambda x: interpolate(
             x, scale_factor=(1, 0.5, 0.5), mode="trilinear"
         )
-        # self.loss_fn = nn.MSELoss(reduction="mean") ## L2 loss
-        self.loss_fn = torch.nn.L1Loss(reduction="mean")
+        self.loss_fn = nn.MSELoss(reduction="mean") ## L2 loss
         # self.nufft_adj = tkbn.KbNufftAdjoint(im_size=nufft_im_size)
+
 
     def forward(
         self,
         weights,
         kspace_data,
         kspace_traj,
-        image_init,
+        image_init, # z ch h w
         csm,
         std,
         weights_flag=True,
     ):
-        tracemalloc.start()
         image_init = torch.nan_to_num_(image_init) 
         image_list = [] 
         x = image_init
         image_list.append(image_init.cpu())
+        ic(csm.shape) # 1 z ch h w
+        ic(kspace_traj.shape) # 1 2 length
         self.forward_model.generate_forward_operators(csm, kspace_traj) #output kspace estimated
-        print(tracemalloc.get_traced_memory())
-        tracemalloc.stop()
-
+        ic(x.shape) # 1 z ch, h w
         x.requires_grad_(True) 
         #estimated kspace will be generated inthe inner_loss function
-        tracemalloc.start()
         for t in range(self.iterations):
             print("iteration", t, "start")
+            
             dc_loss = self.inner_loss(
-                weights,x.clone(), kspace_data,1
+                weights,x.clone(), kspace_data,True
             )  ## data consistency loss
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
-            grad_reg = x - self.regularization(x, std=std)
+            x_s = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,ch,z,h,w -> b,z,ch,h*w
+            ic(grad_dc.shape)
+            ic(x.shape) # b,z,ch,h,w
+            grad_reg = x_s - self.regularization(x_s, std=std)
+            grad_reg = grad_reg.view(grad_reg.shape[0], grad_reg.shape[2], grad_reg.shape[1], grad_reg.shape[3], grad_reg.shape[4])
+            ic(grad_reg.shape)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
-            #updates = -(self.gamma * grad_dc)
             mean_grad_dc_real = torch.mean(grad_dc.real)
             mean_grad_reg = torch.mean(grad_reg.real)
             mean_grad_dc_imag = torch.mean(grad_dc.imag)
             mean_grad_reg_imag = torch.mean(grad_reg.imag)
             # ic(self.gamma)
             ic(self.tau[t]) 
-            x = x.add(updates) #batch, channel, z, h,w
-            image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
+            # x = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,z,ch,h,w
+            x = x.add(updates) # 1,5,1,320,320
+            ############### only turn it on if needed during testing ##############
+            # image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
             print(f"t: {t}, innerloss: {dc_loss}")
             print(f"t:{t}, gdc_real = {mean_grad_dc_real}, gdc_imag = {mean_grad_dc_imag},greg_real = {mean_grad_reg},greg_imag = {mean_grad_reg_imag}")
-        print(tracemalloc.get_traced_memory())
-        tracemalloc.stop()
-        return x, image_list
+        # return x, image_list
+        return x
  
     def inner_loss(self, weights,x, kspace_data,weights_flag): 
         kspace_data_estimated = self.forward_model(x) #x^
@@ -215,8 +214,13 @@ class MOTIF_CORD(nn.Module):
             weights = weights
         else:
             weights = 1
+        ic(kspace_data_estimated.shape) # b z ch length
+        ic(weights.shape)
+        ic(kspace_data.shape)
+        kspace_data_estimated = einx.rearrange("b z ch length -> b ch z length", kspace_data_estimated)
+        kspace_data = einx.rearrange("b z ch length -> b ch z length", kspace_data)
         loss_dc = self.loss_fn(
-            torch.view_as_real(weights * kspace_data_estimated),# [b, ch, z, length] * [b, z, ch, length]
+            torch.view_as_real(weights * kspace_data_estimated),# [b, ch, z, length] * [b, z, length]
             torch.view_as_real(weights * kspace_data),
         )
       
