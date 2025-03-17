@@ -89,10 +89,12 @@ class ComplexUnet(nn.Module):
         
         if self.norm_with_given_std:
             if std is None:
-                print("img has been normalized beforehand")
+                # print("img has been normalized beforehand")
                 x = x
             else:
+                # print('mean regularization input x before normalization:',torch.mean(x))
                 x = x / std
+                # print('mean regularization input x after normalization:',torch.mean(x))
             
         else:
             mean, std = complex_normalize_abs_95_v(

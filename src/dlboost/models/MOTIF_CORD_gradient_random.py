@@ -5,7 +5,7 @@ import numpy as np
 from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
-from mrboost.computation import generate_nufft_op, nufft_2d, nufft_adj_2d
+from mrboost.computation import nufft_2d, nufft_adj_2d
 from pytorch_lightning import LightningModule
 
 
@@ -172,6 +172,7 @@ class MOTIF_CORD(nn.Module):
         image_init = torch.nan_to_num_(image_init) 
         image_list = [] 
         x = image_init
+
         image_list.append(image_init.cpu())
         ic(csm.shape) # 1 z ch h w
         ic(kspace_traj.shape) # 1 2 length
@@ -202,11 +203,11 @@ class MOTIF_CORD(nn.Module):
             # x = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,z,ch,h,w
             x = x.add(updates) # 1,5,1,320,320
             ############### only turn it on if needed during testing ##############
-            # image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
+            image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
             print(f"t: {t}, innerloss: {dc_loss}")
             print(f"t:{t}, gdc_real = {mean_grad_dc_real}, gdc_imag = {mean_grad_dc_imag},greg_real = {mean_grad_reg},greg_imag = {mean_grad_reg_imag}")
-        # return x, image_list
-        return x
+        return x, image_list
+        #return x
  
     def inner_loss(self, weights,x, kspace_data,weights_flag): 
         kspace_data_estimated = self.forward_model(x) #x^
@@ -214,9 +215,6 @@ class MOTIF_CORD(nn.Module):
             weights = weights
         else:
             weights = 1
-        ic(kspace_data_estimated.shape) # b z ch length
-        ic(weights.shape)
-        ic(kspace_data.shape)
         kspace_data_estimated = einx.rearrange("b z ch length -> b ch z length", kspace_data_estimated)
         kspace_data = einx.rearrange("b z ch length -> b ch z length", kspace_data)
         loss_dc = self.loss_fn(

@@ -5,7 +5,7 @@ import numpy as np
 from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
 from dlboost.utils.tensor_utils import interpolate
-from mrboost.computation import generate_nufft_op, nufft_2d, nufft_adj_2d
+from mrboost.computation import nufft_2d, nufft_adj_2d
 from pytorch_lightning import LightningModule
 from mrboost.computation import (
     kspace_point_to_radial_spokes,
