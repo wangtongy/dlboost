@@ -2,8 +2,8 @@ import einx
 import torch
 from torch import nn
 import numpy as np
-from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
-from dlboost.NODEO.Utils import resize_deformation_field
+from dlboost.models import ComplexUnet, DWUNet
+from dlboost.models.ComplexUnet import ComplexUnet_iteration
 from dlboost.utils.tensor_utils import interpolate
 from mrboost.computation import nufft_2d, nufft_adj_2d, fft_1D
 from pytorch_lightning import LightningModule
@@ -198,7 +198,8 @@ class MR_Forward_Model(nn.Module):
     def forward(self, image):
         #_image = image.clone()
         image_multi_ch = self.S(image) #Coil sensitivity * image
-        kspace_data_estimated = self.N(image_multi_ch) # S* F * C * Image
+        hybrid = fft_1D(image_multi_ch,dim=2,norm="ortho")
+        kspace_data_estimated = self.N(hybrid) # S* F * C * Image
         return kspace_data_estimated
 
 class MR_Forward_Model_Static(nn.Module):
@@ -209,8 +210,10 @@ class MR_Forward_Model_Static(nn.Module):
         NUFFT_module=NUFFT,
     ):
         super().__init__()
+        # self.device0 = torch.device("cuda:0")
         self.S = CSM_module()
         self.N = NUFFT_module(nufft_im_size)
+        
 
     def generate_forward_operators(self, csm_kernels, kspace_traj):
         self.S.generate_forward_operator(csm_kernels)
@@ -218,8 +221,10 @@ class MR_Forward_Model_Static(nn.Module):
 
     def forward(self, image):
         #_image = image.clone()
+        # image = image.to(self.device0)
         image_multi_ch = self.S(image) #Coil sensitivity * image
-        kspace_data_estimated = self.N(image_multi_ch) # S* F * C * Image
+        hybrid = fft_1D(image_multi_ch,dim=2,norm="ortho")
+        kspace_data_estimated = self.N(hybrid) # S* F * C * Image
         return kspace_data_estimated
 
 
@@ -259,9 +264,10 @@ class Regularization(nn.Module):
         self.image_denoiser.state_dict(pretrained_state_dict["state_dict"])
 
 
-class Identity_Regularization:
+class Identity_Regularization(nn.Module):
     def __init__(self):
-        self.recon_module = ComplexUnet(
+        super().__init__()
+        self.recon_module = ComplexUnet_iteration(
             1,
             1,
             spatial_dims=3,
@@ -269,11 +275,11 @@ class Identity_Regularization:
             norm_with_given_std=True,
         )
         self.path = "/bmrc-an-data/TongyaoW/Reconstruction/\
-AcceleratedMR/Undersample/MOTIF_CORD_ty/experiments/MOTIF_CORD_random_SE_Pretrain_Unet/MOTIF_CORD_epoch=49.ckpt"
+AcceleratedMR/Undersample/MOTIF_CORD_ty/experiments/Regularization_UNet_dualLoss/MOTIF_CORD_epoch=59.ckpt"
         self.recon_module.state_dict(
-            torch.load(self.path, map_location="cuda")["state_dict"]
+            torch.load(self.path, map_location="cuda:0")["state_dict"]
         )
-        self.recon_module = self.recon_module.cuda()
+        self.recon_module = self.recon_module.to("cuda:0")
 
     def __call__(self, params, std=None):
         return self.recon_module(params, std=std)
@@ -290,8 +296,9 @@ class MOTIF_CORD(nn.Module):
     ):
         super().__init__()
         self.forward_model = MR_Forward_Model_Static(nufft_im_size)
-        # self.forward_model = MR_Forward_Model(nufft_im_size)
         self.regularization = Identity_Regularization()
+        for param in self.regularization.parameters():
+            param.requires_grad = False
         self.epsilon = epsilon
         self.iterations = iterations
         #self.gamma = nn.Parameter(gamma_init*torch.ones(iterations))
@@ -313,41 +320,48 @@ class MOTIF_CORD(nn.Module):
         csm,
         std,
         weights_flag=True,
+        deviceForward = torch.device("cuda:2"),
+        deviceModel = torch.device("cuda:0"),
     ):
         image_init = torch.nan_to_num_(image_init) 
         image_list = [] 
-        x = image_init
-
+        x = image_init.to(deviceForward) # z ch h w
+        csm = csm.to(deviceForward) # 1 ch z h w
+        kspace_traj = kspace_traj.to(deviceForward) # 1 2 length
         image_list.append(image_init.cpu())
         ic(csm.shape) # 1 z ch h w
         ic(kspace_traj.shape) # 1 2 length
-        self.forward_model.generate_forward_operators(csm, kspace_traj) #output kspace estimated
+        self.forward_model.generate_forward_operators(csm, kspace_traj[0]) #output kspace estimated
         ic(x.shape) # 1 z ch, h w
         x.requires_grad_(True) 
-        #estimated kspace will be generated inthe inner_loss function
+
         for t in range(self.iterations):
             print("iteration", t, "start")
-            
+            print("x.requires_grad =", x.requires_grad)
             dc_loss = self.inner_loss(
-                weights,x.clone(), kspace_data,True
+                weights,x.clone(), kspace_data,True,deviceUse=deviceForward
             )  ## data consistency loss
-            breakpoint()
-            grad_dc = torch.autograd.grad(dc_loss, x)[0]
-            # x_s = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,ch,z,h,w -> b,z,ch,h*w
+            
+            grad_dc = torch.autograd.grad(dc_loss, x,retain_graph=False,create_graph=False)[0]
             ic(grad_dc.shape)
             ic(x.shape) # b,z,ch,h,w # 1,5,1,320,320
-            grad_reg = x - self.regularization(x, std=std)
-            # grad_reg = grad_reg.view(grad_reg.shape[0], grad_reg.shape[2], grad_reg.shape[1], grad_reg.shape[3], grad_reg.shape[4])
-            ic(grad_reg.shape)
+            x = x.to(deviceModel)
+            with torch.no_grad():
+                intermediate_x = self.regularization(x, std=std)
+                intermediate_x = torch.view_as_complex(intermediate_x.contiguous()) # (B,C,Z,H,W)
+                intermediate_x *= std
+            grad_reg = x - intermediate_x
+            grad_dc = grad_dc.to(deviceModel)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
+            
             mean_grad_dc_real = torch.mean(grad_dc.real)
             mean_grad_reg = torch.mean(grad_reg.real)
             mean_grad_dc_imag = torch.mean(grad_dc.imag)
             mean_grad_reg_imag = torch.mean(grad_reg.imag)
-            # ic(self.gamma)
             ic(self.tau[t]) 
             # x = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,z,ch,h,w
             x = x.add(updates) # 1,5,1,320,320
+            x = x.detach().requires_grad_(True)
             ############### only turn it on if needed during testing ##############
             image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
             print(f"t: {t}, innerloss: {dc_loss}")
@@ -355,27 +369,15 @@ class MOTIF_CORD(nn.Module):
         return x, image_list
         #return x
  
-    # def inner_loss(self, weights,x, kspace_data,weights_flag): 
-    #     kspace_data_estimated = self.forward_model(x) #x^
-    #     kspace_estimated = fft_1D(kspace_data_estimated,dim=2,norm="ortho")
-    #     if weights_flag:
-    #         weights = weights
-    #     else:
-    #         weights = 1
-    #     breakpoint()
-    #     # kspace_data_estimated = einx.rearrange("b z ch length -> b ch z length", kspace_data_estimated)
-    #     # kspace_data = einx.rearrange("b z ch length -> b ch z length", kspace_data)
-    #     loss_dc = self.loss_fn(
-    #         torch.view_as_real(weights * kspace_estimated),# [b, ch, z, length] * [b, z, length]
-    #         torch.view_as_real(weights * kspace_data),
-    #     )
-      
-    #     #self.log("DC_loss", loss_dc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-    #     return loss_dc
 
-    def inner_loss(self, weights,x, kspace_data,weights_flag): 
-            kspace_data_estimated = self.forward_model(x) #x^
-            breakpoint()
+    def inner_loss(self, weights,x, kspace_data,weights_flag,deviceUse): 
+            x = x.to(deviceUse)
+            kspace_data_estimated = self.forward_model(x) # S*F*C*Image
+            print("kspace_data_estimated.requires_grad =", kspace_data_estimated.requires_grad)
+            deviceUse = kspace_data_estimated.device
+            weights = weights.to(deviceUse)
+            kspace_data = kspace_data.to(deviceUse)
+
             if weights_flag:
                 weights = weights
             else:
@@ -384,6 +386,4 @@ class MOTIF_CORD(nn.Module):
                 torch.view_as_real(weights * kspace_data_estimated),# [b, ch, z, length] * [b, z, ch, length]
                 torch.view_as_real(weights * kspace_data),
             )
-        
-            #self.log("DC_loss", loss_dc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
             return loss_dc

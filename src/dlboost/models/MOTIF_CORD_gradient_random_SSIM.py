@@ -64,6 +64,7 @@ class MOTIF_Pretrain(nn.Module):
         csm,
         weights_flag=True,
     ):
+
         image_init = torch.nan_to_num_(image_init).to(self.device0)
         image_init_target = torch.nan_to_num_(image_init_target).to(self.device0)
         csm = csm.to(self.device0)
@@ -71,7 +72,8 @@ class MOTIF_Pretrain(nn.Module):
         kspace_data = kspace_data.to(self.device0)
         weights = weights.to(self.device0)
         ### Image Loss
-        image_loss = self.gradient_image_loss(image_init, image_init_target) #0.8407
+        ssim_loss = 1-self.ssim_3d(image_init, image_init_target) #0.8407
+    
         image = image_init*csm
         hybrid_kspace = nufft_2d(image,kspace_traj,(320,320),norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)))
         kspace_estimated = fft_1D(hybrid_kspace,dim=2,norm="ortho")
@@ -79,77 +81,91 @@ class MOTIF_Pretrain(nn.Module):
             weights,kspace_estimated, kspace_data,True
         )  ## data consistency loss
         loss = torch.mean(recon_loss) # 0.0079 * = 0.79
-        Final_loss = image_loss + 100*loss
+        Final_loss = ssim_loss + 100*loss
         return Final_loss
 
-    def gradient_image_loss(self,input_img, target_img):
-        
-        # Get gradients for input and target
-        input_img_intensity = input_img.abs()
-        target_img_intensity = target_img.abs()
-        mag_grad_in = self.compute_gradient_3d(input_img_intensity)
-        mag_grad_tg = self.compute_gradient_3d(target_img_intensity)
-
-        intensity_in = input_img.abs()
-        intensity_tg = target_img.abs()
-        
-        L_intensity = torch.mean(self.loss_fn(intensity_in, intensity_tg))
-        # Example: L1 loss on gradients
-        L_gradient = torch.mean(self.loss_fn(mag_grad_in, mag_grad_tg))
-        
-        L_img = 2*L_intensity + L_gradient
-        
-        return L_img
-    
-    def compute_gradient_3d(self,img):
+    def create_3d_gaussian_kernel(self,win_size, sigma, channels, device, dtype=torch.float32):
         """
-        Computes 3D gradients (grad_x, grad_y, grad_z) of 'img' using Sobel filters.
-        img should have shape: (batch_size, channels, D, H, W).
-        Returns:
-            grad_x, grad_y, grad_z (each shape: (batch_size, channels, D, H, W)).
+        Creates a 5D Gaussian filter for 3D convolution:
+        shape = (channels, 1, win_size, win_size, win_size).
         """
-        device = img.device
-        # 1D filters for Sobel construction
-        smoothing_1d = torch.tensor([1., 2., 1.])
-        derivative_1d = torch.tensor([-1., 0., 1.])
+        # 1D coordinates centered at 0
+        coords = torch.arange(win_size, device=device, dtype=dtype) - (win_size - 1)/2.0
+        # 1D Gaussian
+        g_1d = torch.exp(-coords**2/(2*sigma**2))
+        g_1d /= g_1d.sum()
+        
+        # Outer products to form 3D kernel
+        g_3d = g_1d[:, None, None] * g_1d[None, :, None] * g_1d[None, None, :]
+        g_3d /= g_3d.sum()  # normalize
 
-        # Build Sobel kernel for derivative in x, smoothing in y & z
-        sobel_x = torch.zeros((3, 3, 3),device=device)
-        for z in range(3):
-            for y in range(3):
-                for x in range(3):
-                    sobel_x[z, y, x] = derivative_1d[x] * smoothing_1d[y] * smoothing_1d[z]
-        sobel_x = sobel_x.view(1, 1, 3, 3, 3)
+        # Reshape for conv3d => [out_channels=channels, in_channels=1, D, H, W]
+        g_3d = g_3d.view(1, 1, win_size, win_size, win_size)
+        g_3d = g_3d.repeat(channels, 1, 1, 1, 1)
+        return g_3d
 
-        # Build Sobel kernel for derivative in y, smoothing in x & z
-        sobel_y = torch.zeros((3, 3, 3),device=device)
-        for z in range(3):
-            for y in range(3):
-                for x in range(3):
-                    sobel_y[z, y, x] = smoothing_1d[x] * derivative_1d[y] * smoothing_1d[z]
-        sobel_y = sobel_y.view(1, 1, 3, 3, 3)
+    def ssim_3d(
+            self,
+        vol1: torch.Tensor,
+        vol2: torch.Tensor,
+        win_size: int = 3,
+        sigma: float = 1.0,
+        data_range: float = None
+    ) -> torch.Tensor:
+        """
+        Computes 3D SSIM between two volumes of shape [H, W, D].
+        Returns a scalar in [0,1], where 1 = identical.
+        
+        Args:
+            vol1, vol2: shape [H, W, D]. (Single-channel 3D volumes)
+            win_size: size of the 3D Gaussian kernel. Typically 3 or 5 for 3D.
+            sigma: std for Gaussian kernel.
+            data_range: difference between max and min of volumes.
+                        If None, it is computed from vol1 & vol2.
+        """
+        # 1) Unsqueeze to [B=1, C=1, H, W, D]
+        vol1 = vol1.abs()
+        vol2 = vol2.abs()
 
-        # Build Sobel kernel for derivative in z, smoothing in x & y
-        sobel_z = torch.zeros((3, 3, 3),device=device)
-        for z in range(3):
-            for y in range(3):
-                for x in range(3):
-                    sobel_z[z, y, x] = smoothing_1d[x] * smoothing_1d[y] * derivative_1d[z]
-        sobel_z = sobel_z.view(1, 1, 3, 3, 3)
-        # Repeat each kernel for all input channels, if necessary
-        channels = img.shape[1]  # number of channels # b ch z h w
-        sobel_x = sobel_x.repeat(channels, 1, 1, 1, 1)  # shape: (channels, 1, 3, 3, 3)
-        sobel_y = sobel_y.repeat(channels, 1, 1, 1, 1)
-        sobel_z = sobel_z.repeat(channels, 1, 1, 1, 1)
+        dtype = vol1.dtype
 
-        # 3D Convolution with padding=1 to keep same spatial/depth size
-        grad_x = F.conv3d(img, sobel_x, padding=1, groups=channels)
-        grad_y = F.conv3d(img, sobel_y, padding=1, groups=channels)
-        grad_z = F.conv3d(img, sobel_z, padding=1, groups=channels)
+        # 2) Determine data_range if not provided
+        if data_range is None:
+            min_val = torch.min(vol1.min(), vol2.min())
+            max_val = torch.max(vol1.max(), vol2.max())
+            data_range = (max_val - min_val).clamp_min(1e-8)
 
-        mag_grad = torch.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
+        # SSIM constants (following the original paper)
+        K1, K2 = 0.01, 0.03
+        C1 = (K1 * data_range) ** 2
+        C2 = (K2 * data_range) ** 2
 
-        return mag_grad
+        # 3) Build 3D Gaussian kernel
+        channels = 1  # single-channel
+        window_3d = self.create_3d_gaussian_kernel(
+            win_size, sigma, channels, self.device0, dtype
+        )
+
+        # 4) Compute local means via 3D convolution
+        mu1 = F.conv3d(vol1, window_3d, padding=win_size//2, groups=channels)
+        mu2 = F.conv3d(vol2, window_3d, padding=win_size//2, groups=channels)
+
+        mu1_sq   = mu1.pow(2)
+        mu2_sq   = mu2.pow(2)
+        mu1_mu2  = mu1 * mu2
+
+        # 5) Compute local variances & covariance
+        sigma1_sq = F.conv3d(vol1 * vol1, window_3d, padding=win_size//2, groups=channels) - mu1_sq
+        sigma2_sq = F.conv3d(vol2 * vol2, window_3d, padding=win_size//2, groups=channels) - mu2_sq
+        sigma12   = F.conv3d(vol1 * vol2, window_3d, padding=win_size//2, groups=channels) - mu1_mu2
+
+        # 6) SSIM formula
+        num = (2.0 * mu1_mu2 + C1) * (2.0 * sigma12 + C2)
+        den = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim_map = num / (den + 1e-12)
+
+    # 7) Return mean SSIM over the 3D volume
+        return ssim_map.mean()
 
     def outer_loss(self, weights,kspace_data_estimated, kspace_data,weights_flag): 
         
@@ -204,6 +220,7 @@ class MR_Forward_Model(nn.Module):
 class MR_Forward_Model_Static(nn.Module):
     def __init__(
         self,
+        image_size,
         nufft_im_size,
         CSM_module=CSM_FixPh,
         NUFFT_module=NUFFT,
@@ -282,6 +299,7 @@ AcceleratedMR/Undersample/MOTIF_CORD_ty/experiments/MOTIF_CORD_random_SE_Pretrai
 class MOTIF_CORD(nn.Module):
     def __init__(
         self,
+        patch_size: tuple = (16, 320, 320),
         nufft_im_size: tuple = (320, 320),
         epsilon: float = 1e-2,
         iterations: int = 5,
@@ -289,7 +307,7 @@ class MOTIF_CORD(nn.Module):
         tau_init=0.2,
     ):
         super().__init__()
-        self.forward_model = MR_Forward_Model_Static(nufft_im_size)
+        self.forward_model = MR_Forward_Model_Static(patch_size, nufft_im_size)
         # self.forward_model = MR_Forward_Model(nufft_im_size)
         self.regularization = Identity_Regularization()
         self.epsilon = epsilon
@@ -331,7 +349,7 @@ class MOTIF_CORD(nn.Module):
             dc_loss = self.inner_loss(
                 weights,x.clone(), kspace_data,True
             )  ## data consistency loss
-            breakpoint()
+   
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
             # x_s = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,ch,z,h,w -> b,z,ch,h*w
             ic(grad_dc.shape)
