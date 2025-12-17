@@ -72,7 +72,7 @@ class MR_Forward_Model_Static(nn.Module):
 
 
 class Regularization(nn.Module):
-    def __init__(self, pretrained_path="/bmrc-an-data/TongyaoW/Reconstruction/AcceleratedMR/Undersample/blackbone/experiments/BB_N2N_pretrain/N2N_Stationary_epoch=02.ckpt"):
+    def __init__(self,target_device:str | torch.device="cuda"):
         super().__init__()
         self.image_denoiser = ComplexUnet(
             1,
@@ -93,10 +93,11 @@ class Regularization(nn.Module):
                 ),
             ),
             norm_with_given_std=True,
+            
         )
-        if pretrained_path is not None:
-            self.load_pretrained(pretrained_path)
-
+        # if pretrained_path is not None:
+        #     self.load_pretrained(pretrained_path)
+        self.target_device= torch.device(target_device)
     def forward(self, params, std):
         std = std.to(torch.float32)
         return self.image_denoiser(params, std=std)
@@ -148,10 +149,11 @@ class MOTIF_CORD(nn.Module):
         iterations: int = 5,
         gamma_init=0.01,
         tau_init=0.2,
+        device="cuda",
     ):
         super().__init__()
         self.forward_model = MR_Forward_Model_Static(patch_size, nufft_im_size)
-        self.regularization = Regularization()
+        self.regularization = Regularization(target_device=device)
         self.epsilon = epsilon
         self.iterations = iterations
         #self.gamma = nn.Parameter(gamma_init*torch.ones(iterations))
@@ -192,7 +194,11 @@ class MOTIF_CORD(nn.Module):
                 weights,x.clone(), kspace_data,1
             )  ## data consistency loss
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
-            grad_reg = x - self.regularization(x, std=std)
+            # interm = self.regularization(x, std=std)
+            # interm = interm.detach()
+            x_real = torch.view_as_real(x)
+            grad_reg = x_real - self.regularization(x, std=std)
+            grad_reg = torch.view_as_complex(grad_reg)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
             #updates = -(self.gamma * grad_dc)
             mean_grad_dc_real = torch.mean(grad_dc.real)

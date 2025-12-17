@@ -42,112 +42,14 @@ class ComplexUnet(nn.Module):
         upsample: str = "nontrainable",
         pad_factor: int = 16,
         conv_net: nn.Module | None = None,
-        input_append_channel: int=0,
-        norm_with_given_std: bool=True,
-        # target_device: str="cuda:0",
-        ):
-
-        super().__init__()
-        self.unet: nn.Module
-        self.in_channels = in_channels
-        self.input_append_channel = input_append_channel
-        # self.target_device = torch.device(target_device)
-        if conv_net is None:
-            self.unet = BasicUNet(
-                spatial_dims=spatial_dims,
-                in_channels=2 * in_channels + self.input_append_channel,
-                out_channels=2 * out_channels,
-                features=features,
-                act=act,
-                norm=norm,
-                bias=bias,
-                dropout=dropout,
-                upsample=upsample,
-            )
-        else:
-            # self.unet = conv_net.to(self.target_device)
-            self.unet = conv_net
-        self.norm_with_given_std = norm_with_given_std
-        self.pad_factor = pad_factor
-
-    def forward(
-        self,
-        x: Tensor,
-        input_append_channel: Tensor | None = None,
-        std: Tensor | float = None,
-    ) -> Tensor:
-        """
-        Args:
-            x: input of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
-
-        Returns:
-            output of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
-        """
-        # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
-        # print(x.shape)
-        # x = x.to(self.target_device)
-        ic(x.shape)
-        # change x to float
-        # std = std.to(self.target_device)
-        if self.norm_with_given_std:
-            if std is None:
-                print("img has been normalized beforehand")
-                x = x
-            else:
-                print("img will be normalized by the given std")
-                # print('mean regularization input x before normalization:',torch.mean(x))
-                x = x / std
-                # print('mean regularization input x after normalization:',torch.mean(x))
-            
-        else:
-            mean, std = complex_normalize_abs_95_v(
-                x
-            )  # x will be of shape (B,C*2,H,W)
-            x = x / std
-        # breakpoint()
-        ic(x.shape)
-        x = torch.view_as_real(x)
-        # x = einx.rearrange("b z b h w com -> b z h w com", x)
-        x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
-        if input_append_channel is not None:
-            x = einx.rearrange(
-                "b c1 ..., b c2 ... -> b (c1+c2) ...", x, input_append_channel
-            )
-
-        x, pad_sizes = divisible_pad_t(x, self.pad_factor)
-        x = self.unet(x)
-        x = inverse_divisible_pad_t(x, pad_sizes)
-        x = reshape_channel_complex_to_last_dim(
-            x
-        )  # x will be of shape (B,C,H,W,2)
-        return x
-
-class ComplexUnet_iteration(nn.Module):
-    def __init__(
-        self,
-        in_channels: int = 3,
-        out_channels: int = 3,
-        spatial_dims: int = 2,
-        features: Sequence[int] = (32, 32, 64, 128, 256, 32),
-        act: str | tuple = (
-            "LeakyReLU",
-            {"negative_slope": 0.1, "inplace": True},
-        ),
-        norm: str | tuple = ("instance", {"affine": True}),
-        bias: bool = True,
-        dropout: float | tuple = 0.0,
-        upsample: str = "nontrainable",
-        pad_factor: int = 16,
-        conv_net: nn.Module | None = None,
         input_append_channel=0,
         norm_with_given_std=True,
-        Regularization_cuda="cuda:1",
     ):
         super().__init__()
         self.unet: nn.Module
         self.in_channels = in_channels
         self.input_append_channel = input_append_channel
-        self.target_device = torch.device(Regularization_cuda)
+        self.target_device = torch.device("cuda:0")
         if conv_net is None:
             self.unet = BasicUNet(
                 spatial_dims=spatial_dims,
@@ -179,7 +81,100 @@ class ComplexUnet_iteration(nn.Module):
             output of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
         """
         # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
-        print('target_device in iteration unet:', self.target_device)
+        # print(x.shape)
+        x = x.to(self.target_device)
+        std = std.to(self.target_device)
+        if self.norm_with_given_std:
+            if std is None:
+                print("img has been normalized beforehand")
+                x = x
+            else:
+                print("img will be normalized by the given std")
+                # print('mean regularization input x before normalization:',torch.mean(x))
+                x = x / std
+                # print('mean regularization input x after normalization:',torch.mean(x))
+            
+        else:
+            mean, std = complex_normalize_abs_95_v(
+                x
+            )  # x will be of shape (B,C*2,H,W)
+            x = x / std
+        # breakpoint()
+        x = torch.view_as_real(x)
+
+        x = reshape_complex_to_channel_dim(x)  # x will be of shape (B,C*2,H,W)
+        if input_append_channel is not None:
+            x = einx.rearrange(
+                "b c1 ..., b c2 ... -> b (c1+c2) ...", x, input_append_channel
+            )
+
+        x, pad_sizes = divisible_pad_t(x, self.pad_factor)
+        x = self.unet(x)
+        x = inverse_divisible_pad_t(x, pad_sizes)
+        x = reshape_channel_complex_to_last_dim(
+            x
+        )  # x will be of shape (B,C,H,W,2)
+        # x = torch.view_as_complex(x.contiguous()) # (B,C,Z,H,W)
+        # x *= std
+        return x
+
+class ComplexUnet_iteration(nn.Module):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        out_channels: int = 3,
+        spatial_dims: int = 2,
+        features: Sequence[int] = (32, 32, 64, 128, 256, 32),
+        act: str | tuple = (
+            "LeakyReLU",
+            {"negative_slope": 0.1, "inplace": True},
+        ),
+        norm: str | tuple = ("instance", {"affine": True}),
+        bias: bool = True,
+        dropout: float | tuple = 0.0,
+        upsample: str = "nontrainable",
+        pad_factor: int = 16,
+        conv_net: nn.Module | None = None,
+        input_append_channel=0,
+        norm_with_given_std=True,
+    ):
+        super().__init__()
+        self.unet: nn.Module
+        self.in_channels = in_channels
+        self.input_append_channel = input_append_channel
+        self.target_device = torch.device("cuda:0")
+        if conv_net is None:
+            self.unet = BasicUNet(
+                spatial_dims=spatial_dims,
+                in_channels=2 * in_channels + self.input_append_channel,
+                out_channels=2 * out_channels,
+                features=features,
+                act=act,
+                norm=norm,
+                bias=bias,
+                dropout=dropout,
+                upsample=upsample,
+            ).to(self.target_device)
+        else:
+            self.unet = conv_net.to(self.target_device)
+        self.norm_with_given_std = norm_with_given_std
+        self.pad_factor = pad_factor
+
+    def forward(
+        self,
+        x: Tensor,
+        input_append_channel: Tensor | None = None,
+        std: Tensor | float = None,
+    ) -> Tensor:
+        """
+        Args:
+            x: input of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
+
+        Returns:
+            output of shape (B,C,H,W) for 2D data or (B,C,H,W,D) for 3D data
+        """
+        # suppose the input is 2D, the comment in front of each operator below shows the shape after that operator
+        # print(x.shape)
         x = x.to(self.target_device)
         std = std.to(self.target_device)
         if self.norm_with_given_std:

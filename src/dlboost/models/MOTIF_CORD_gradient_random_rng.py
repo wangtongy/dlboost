@@ -1,6 +1,6 @@
 import einx
 import torch
-from torch import nn, view_as_real
+from torch import nn
 import numpy as np
 from dlboost.models import ComplexUnet, DWUNet, SpatialTransformNetwork
 from dlboost.NODEO.Utils import resize_deformation_field
@@ -46,21 +46,21 @@ class MOTIF_Pretrain(nn.Module):
     def __init__(
         self,
         nufft_im_size: tuple = (320, 320),
-        forward_device = "cuda:1",
-        ACS_list = list(range(140,180)),
+        device0 = torch.device("cuda:2"),
     ):
         super().__init__()
-        self.device0 = torch.device(forward_device)
+        self.device0 = device0
         self.nufft_im_size = nufft_im_size
+        # self.forward_model = MR_Forward_Model(nufft_im_size).to(self.device0)
         self.loss_fn = nn.L1Loss(reduction="mean") ## L1 loss
-        self.ACS_list = ACS_list
+        # self.loss_fn = nn.MSELoss(reduction = "mean") # L2 loss
 
     def forward(
         self,
-        kspace_data,#target kspace data
+        kspace_data,
         weights,
         kspace_traj,
-        image_init, # z ch h w # estimated image
+        image_init, # z ch h w
         image_init_target,
         csm,
         weights_flag=True,
@@ -72,31 +72,15 @@ class MOTIF_Pretrain(nn.Module):
         kspace_data = kspace_data.to(self.device0)
         weights = weights.to(self.device0)
         ### Image Loss
-        image = image_init*csm
         image_loss = self.gradient_image_loss(image_init, image_init_target) #0.8407
-
+        image = image_init*csm
         hybrid_kspace = nufft_2d(image,kspace_traj,(320,320),norm_factor=2 * np.sqrt(np.prod(self.nufft_im_size)))
         kspace_estimated = fft_1D(hybrid_kspace,dim=2,norm="ortho")
-        kspace_estimated_ACS = kspace_estimated[:,:, self.ACS_list, :]  # b,ch,z,length
-        all_z = torch.arange(kspace_estimated.shape[2], device=kspace_estimated.device)
-        non_acs_z = all_z[~torch.isin(all_z, self.ACS_list)]
-        kspace_estimated_non_ACS = kspace_estimated[:,:, non_acs_z, :]  # b,ch,z,length
-        kspace_data_ACS = kspace_data[:,:, self.ACS_list, :]
-        kspace_data_non_ACS = kspace_data[:,:, non_acs_z, :]
-
         recon_loss = self.outer_loss(
-            weights,kspace_estimated_non_ACS, kspace_data_non_ACS,True
+            weights,kspace_estimated, kspace_data,True
         )  ## data consistency loss
-
-        outer_acs_loss = self.outer_loss(
-            weights,kspace_estimated_ACS, kspace_data_ACS,True
-        )
-        loss = recon_loss + 0.1*outer_acs_loss
-        print("No ACS Loss:", recon_loss.item())
-        print("ACS Loss:", outer_acs_loss.item())
-        print("Total Kspace Loss:", loss.item())
-        print("Image Loss:", image_loss.item())
-        Final_loss = image_loss + 10*loss
+        loss = torch.mean(recon_loss) # 0.0079 * = 0.79
+        Final_loss = image_loss + 100*loss
         return Final_loss
 
     def gradient_image_loss(self,input_img, target_img):
@@ -104,35 +88,20 @@ class MOTIF_Pretrain(nn.Module):
         # Get gradients for input and target
         input_img_intensity = input_img.abs()
         target_img_intensity = target_img.abs()
-        mag_grad_in = self.total_variation_loss(input_img_intensity)
-        mag_grad_tg = self.total_variation_loss(target_img_intensity)
+        mag_grad_in = self.compute_gradient_3d(input_img_intensity)
+        mag_grad_tg = self.compute_gradient_3d(target_img_intensity)
 
-        intensity_in_real = input_img.real
-        intensity_tg_real = target_img.real
-        intensity_in_img = input_img.imag
-        intensity_tg_img = target_img.imag
-        L_intensity = self.loss_fn(intensity_in_real, intensity_tg_real)+ self.loss_fn(intensity_in_img, intensity_tg_img)
+        intensity_in = input_img.abs()
+        intensity_tg = target_img.abs()
+        
+        L_intensity = torch.mean(self.loss_fn(intensity_in, intensity_tg))
         # Example: L1 loss on gradients
-        print("Image intensity Loss:", L_intensity.item())
-        L_TV = self.loss_fn(mag_grad_in, mag_grad_tg)
-        print("Image gradient Loss:", L_TV.item())
-        L_img = 2*L_intensity + L_TV
-
+        L_gradient = torch.mean(self.loss_fn(mag_grad_in, mag_grad_tg))
+        
+        L_img = 2*L_intensity + L_gradient
+        
         return L_img
     
-
-    def total_variation_loss(self, img):
-        """
-        Computes the total variation loss for a 3D image.
-        img should have shape: (batch_size, channels, D, H, W).
-        Returns:
-            TV loss (scalar).
-        """
-        dx = torch.abs(img[:, :, 1:, :, :] - img[:, :, :-1, :, :])
-        dy = torch.abs(img[:, :, :, 1:, :] - img[:, :, :, :-1, :])
-        dz = torch.abs(img[:, :, :, :, 1:] - img[:, :, :, :, :-1])
-        tv_loss = torch.mean(dx) + torch.mean(dy) + torch.mean(dz)
-        return tv_loss
     def compute_gradient_3d(self,img):
         """
         Computes 3D gradients (grad_x, grad_y, grad_z) of 'img' using Sobel filters.
@@ -192,7 +161,7 @@ class MOTIF_Pretrain(nn.Module):
         else:
             weights = 1
         ic(kspace_data_estimated.shape)
-        if kspace_data_estimated.shape[1] == 64: # 64 channel too large.
+        if kspace_data_estimated.shape[1] == 64:
             kspace_data_estimated = torch.split(kspace_data_estimated, 32, dim=1)
             kspace_data = torch.split(kspace_data, 32, dim=1)
             loss_total = []
@@ -251,7 +220,6 @@ class MR_Forward_Model_Static(nn.Module):
     def forward(self, image):
         #_image = image.clone()
         image_multi_ch = self.S(image) #Coil sensitivity * image
-        ic(image_multi_ch.shape)
         kspace_data_estimated = self.N(image_multi_ch) # S* F * C * Image
         return kspace_data_estimated
 
@@ -268,8 +236,7 @@ class Regularization(nn.Module):
                 in_channels=2,
                 out_channels=2,
                 # features=(8, 16, 32, 64, 128),
-                features = (16,32,64,128,256),
-                # features=(32, 64, 128, 256, 512),
+                features=(32, 64, 128, 256, 512),
                 strides=((2, 2, 2), (2, 2, 2), (1, 2, 2), (1, 2, 2)),
                 kernel_sizes=(
                     (3, 3, 3),
@@ -325,8 +292,7 @@ class MOTIF_CORD(nn.Module):
         super().__init__()
         self.forward_model = MR_Forward_Model_Static(nufft_im_size)
         # self.forward_model = MR_Forward_Model(nufft_im_size)
-        # self.regularization = Identity_Regularization()
-        self.regularization = Regularization()
+        self.regularization = Identity_Regularization()
         self.epsilon = epsilon
         self.iterations = iterations
         #self.gamma = nn.Parameter(gamma_init*torch.ones(iterations))
@@ -366,15 +332,12 @@ class MOTIF_CORD(nn.Module):
             dc_loss = self.inner_loss(
                 weights,x.clone(), kspace_data,True
             )  ## data consistency loss
+            breakpoint()
             grad_dc = torch.autograd.grad(dc_loss, x)[0]
             # x_s = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,ch,z,h,w -> b,z,ch,h*w
             ic(grad_dc.shape)
             ic(x.shape) # b,z,ch,h,w # 1,5,1,320,320
-            intermediate = self.regularization(x, std=std)
-            ic(intermediate.shape) # 1,1,5,320,320,2
-            intermediate = intermediate.contiguous()
-            intermediate_real = torch.view_as_complex(intermediate) # 1,1,5,320,320 
-            grad_reg = x - intermediate_real #self.regularization output: 5,1,1,320,320,2
+            grad_reg = x - self.regularization(x, std=std)
             # grad_reg = grad_reg.view(grad_reg.shape[0], grad_reg.shape[2], grad_reg.shape[1], grad_reg.shape[3], grad_reg.shape[4])
             ic(grad_reg.shape)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
@@ -413,17 +376,15 @@ class MOTIF_CORD(nn.Module):
 
     def inner_loss(self, weights,x, kspace_data,weights_flag): 
             kspace_data_estimated = self.forward_model(x) #x^
+            breakpoint()
             if weights_flag:
                 weights = weights
             else:
                 weights = 1
-            ic(weights.shape) # 1,patch(z),length
-            ic(kspace_data_estimated.shape) #1,patch(z),ch,length
-            ch = kspace_data_estimated.shape[2]
-            weights1 = einx.rearrange("b z length -> b z ch length", weights,ch=ch)
             loss_dc = self.loss_fn(
-                torch.view_as_real(weights1 * kspace_data_estimated),# [b, ch, z, length] * [b, z, ch, length]
-                torch.view_as_real(weights1 * kspace_data),
+                torch.view_as_real(weights * kspace_data_estimated),# [b, ch, z, length] * [b, z, ch, length]
+                torch.view_as_real(weights * kspace_data),
             )
+        
             #self.log("DC_loss", loss_dc, on_step=True, on_epoch=True, prog_bar=True, logger=True)
             return loss_dc

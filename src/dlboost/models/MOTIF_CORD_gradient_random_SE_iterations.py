@@ -210,7 +210,6 @@ class MR_Forward_Model_Static(nn.Module):
         NUFFT_module=NUFFT,
     ):
         super().__init__()
-        # self.device0 = torch.device("cuda:0")
         self.S = CSM_module()
         self.N = NUFFT_module(nufft_im_size)
         
@@ -220,7 +219,6 @@ class MR_Forward_Model_Static(nn.Module):
         self.N.generate_forward_operator(kspace_traj)
 
     def forward(self, image):
-        #_image = image.clone()
         # image = image.to(self.device0)
         image_multi_ch = self.S(image) #Coil sensitivity * image
         hybrid = fft_1D(image_multi_ch,dim=2,norm="ortho")
@@ -273,13 +271,25 @@ class Identity_Regularization(nn.Module):
             spatial_dims=3,
             conv_net=None,
             norm_with_given_std=True,
+            # Regularization_cuda=Regularization_cuda,
         )
-        self.path = "/bmrc-an-data/TongyaoW/Reconstruction/\
-AcceleratedMR/Undersample/MOTIF_CORD_ty/experiments/Regularization_UNet_dualLoss/MOTIF_CORD_epoch=59.ckpt"
-        self.recon_module.state_dict(
-            torch.load(self.path, map_location="cuda:0")["state_dict"]
+        self.path = (
+            "/bmrc-an-data/TongyaoW/Reconstruction/"
+            "AcceleratedMR/Undersample/MOTIF_CORD_ty/"
+            "experiments/Regularization_UNet_dualLoss/"
+            "MOTIF_CORD_epoch=59.ckpt"
         )
-        self.recon_module = self.recon_module.to("cuda:0")
+        checkpoint = torch.load(self.path)
+        state_dict = checkpoint["state_dict"]
+        # new_state_dict = {
+        #     f"unet.{k}": v
+        #     for k, v in state_dict.items()
+        # }
+
+        self.load_state_dict(state_dict, strict=True)
+        
+        # self.recon_module.load_state_dict(new_state_dict)
+        # self.recon_module.to(Regularization_cuda)
 
     def __call__(self, params, std=None):
         return self.recon_module(params, std=std)
@@ -293,9 +303,11 @@ class MOTIF_CORD(nn.Module):
         iterations: int = 5,
         gamma_init=0.01,
         tau_init=0.2,
+        # regularization_device = "cuda:1",
     ):
         super().__init__()
         self.forward_model = MR_Forward_Model_Static(nufft_im_size)
+        # self.regularization = Identity_Regularization(regularization_device)
         self.regularization = Identity_Regularization()
         for param in self.regularization.parameters():
             param.requires_grad = False
@@ -319,17 +331,18 @@ class MOTIF_CORD(nn.Module):
         image_init, # z ch h w
         csm,
         std,
-        weights_flag=True,
-        deviceForward = torch.device("cuda:2"),
-        deviceModel = torch.device("cuda:0"),
+        weights_flag,
+        deviceForward,
     ):
         image_init = torch.nan_to_num_(image_init) 
         image_list = [] 
         x = image_init.to(deviceForward) # z ch h w
         csm = csm.to(deviceForward) # 1 ch z h w
+        print('deviceForward:', deviceForward)
+        # print('deviceModel:', deviceModel)
         kspace_traj = kspace_traj.to(deviceForward) # 1 2 length
         image_list.append(image_init.cpu())
-        ic(csm.shape) # 1 z ch h w
+        ic(csm.shape) # 1, ch ,z, h ,w 
         ic(kspace_traj.shape) # 1 2 length
         self.forward_model.generate_forward_operators(csm, kspace_traj[0]) #output kspace estimated
         ic(x.shape) # 1 z ch, h w
@@ -345,19 +358,14 @@ class MOTIF_CORD(nn.Module):
             grad_dc = torch.autograd.grad(dc_loss, x,retain_graph=False,create_graph=False)[0]
             ic(grad_dc.shape)
             ic(x.shape) # b,z,ch,h,w # 1,5,1,320,320
-            x = x.to(deviceModel)
+            # x = x.to(deviceModel)
             with torch.no_grad():
                 intermediate_x = self.regularization(x, std=std)
                 intermediate_x = torch.view_as_complex(intermediate_x.contiguous()) # (B,C,Z,H,W)
                 intermediate_x *= std
             grad_reg = x - intermediate_x
-            grad_dc = grad_dc.to(deviceModel)
+            # grad_dc = grad_dc.to(deviceModel)
             updates = -self.gamma * (grad_dc + self.tau[t] * grad_reg)
-            
-            mean_grad_dc_real = torch.mean(grad_dc.real)
-            mean_grad_reg = torch.mean(grad_reg.real)
-            mean_grad_dc_imag = torch.mean(grad_dc.imag)
-            mean_grad_reg_imag = torch.mean(grad_reg.imag)
             ic(self.tau[t]) 
             # x = x.view(x.shape[0], x.shape[2], x.shape[1], x.shape[3], x.shape[4]) # b,z,ch,h,w
             x = x.add(updates) # 1,5,1,320,320
@@ -365,16 +373,17 @@ class MOTIF_CORD(nn.Module):
             ############### only turn it on if needed during testing ##############
             image_list.append(x.clone().detach().cpu()) #itr, b,c,z,h,w
             print(f"t: {t}, innerloss: {dc_loss}")
-            print(f"t:{t}, gdc_real = {mean_grad_dc_real}, gdc_imag = {mean_grad_dc_imag},greg_real = {mean_grad_reg},greg_imag = {mean_grad_reg_imag}")
-        return x, image_list
-        #return x
+            # print(f"t:{t}, gdc_real = {mean_grad_dc_real}, gdc_imag = {mean_grad_dc_imag},greg_real = {mean_grad_reg},greg_imag = {mean_grad_reg_imag}")
+            ic(torch.mean(x.real))
+            ic(torch.mean(x.imag))
+        return x
  
 
     def inner_loss(self, weights,x, kspace_data,weights_flag,deviceUse): 
             x = x.to(deviceUse)
             kspace_data_estimated = self.forward_model(x) # S*F*C*Image
             print("kspace_data_estimated.requires_grad =", kspace_data_estimated.requires_grad)
-            deviceUse = kspace_data_estimated.device
+            # deviceUse = kspace_data_estimated.device
             weights = weights.to(deviceUse)
             kspace_data = kspace_data.to(deviceUse)
 
